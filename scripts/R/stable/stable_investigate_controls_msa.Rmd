@@ -1,0 +1,533 @@
+---
+title: "Technical Invstigation Summary - MSA Human Controls"
+author: "Bret D. Barnes"
+date: "2023-06-20"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.align="center",
+                      fig.height = 9, fig.width = 7,
+                      root.dir = '~/Desktop/TESummary_2023May/',
+                      fig.path = '~/Desktop/TESummary_2023May/')
+```
+
+## Overview
+
+Investigation of differences between ACA A2-manifest and Bret's A1 updated controls manifest. 
+
+Fill in addtional high level details...
+
+### Libraries
+
+```{r eval=F,echo=F}
+# Code for installing packages IF not already installed
+list.of.packages <- c("knitr","ggplot2","tidyverse",
+                      "cowplot","factoextra","ggridges","randomForest",
+                      "kableExtra","wesanderson","optparse")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+# Installing packages from bioconductor
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("sesame")
+sesameDataCache()
+```
+
+```{r comment = F,message=F}
+suppressWarnings(suppressPackageStartupMessages( 
+  base::require(knitr, quietly = TRUE) ) )
+suppressWarnings(suppressPackageStartupMessages( 
+  base::require(sesame, quietly = TRUE) ) )
+suppressWarnings(suppressPackageStartupMessages( 
+  base::require(tidyverse, quietly = TRUE) ) )
+suppressWarnings(suppressPackageStartupMessages( 
+  base::require(ggplot2, quietly = TRUE) ) )
+suppressWarnings(suppressPackageStartupMessages( 
+  base::require(cowplot, quietly = TRUE) ) )
+suppressWarnings(suppressPackageStartupMessages( 
+  base::require(factoextra, quietly = TRUE) ) )
+suppressWarnings(suppressPackageStartupMessages( 
+  base::require(ggridges, quietly = TRUE) ) )
+suppressWarnings(suppressPackageStartupMessages( 
+  base::require(wesanderson, quietly = TRUE) ) )
+suppressWarnings(suppressPackageStartupMessages( 
+  base::require(optparse, quietly = TRUE) ) )
+```
+
+## Data
+
+### Inputs 
+
+1) `beta` - Matrix of beta values for all technical replicates
+2) `poobah` - Matrix of poobah scores for all technical replicates
+3) `meta` - Associated meta file for all technical replicate samples
+
+```{r comment = F, message = F, eval=F}
+# data is located in /dat subfolder
+setwd('~/Documents/Projects.new/MSA/data/from-Jenn-MSA3/MSAV03_A2_v2/')
+## Data files
+# Beta matrix - Matrix of beta values for all technical replicate samples (Samples x Probes)
+# Only contains probes that are NOT masked by ILMN V3 masked manifest
+beta <- read_csv('dat/beta_RBRW_CBD_ILMN_v3_MANIFEST3_unmaskedProbes.csv.gz',
+                 show_col_types = F)
+# POOBAH matrix - Corresponding matrix of poobah values for each sample and probe
+poobah <- read_csv('dat/poobah_RBRW_CBD_ILMN_v3_MANIFEST3_unmaskedProbes.csv.gz',
+                   show_col_types = F)
+# Meta file with additional information about each sample
+meta <- read_csv('dat/samplequality_RBRW_CBD_ILMN_v3_MANIFEST3_simplified.csv',
+                 show_col_types = FALSE)
+```
+
+### Reformat meta file
+
+Split `sample_id` to extract the chip number and the relative position on the chip for each sample.
+
+```{r eval=F}
+## Reformating meta file to extract sample row and column information on each chip
+sample_id <- data.frame(str_split(meta$sample_id,pattern = '_|R|C',simplify = T)) %>%
+  dplyr::select(-2) %>%
+  dplyr::rename('chip'  = 1,'chip_row' = 2,'chip_col' = 3) %>%
+  mutate_all(as.numeric)
+
+m_df <- meta %>%
+  mutate(run = ifelse(Experiment_id == '3-Experiment_TechnicalReplicates','Run1',run)) %>%
+  dplyr::select(any_of(meta_cols)) %>%
+  cbind(sample_id)
+```
+
+### Drop samples that did not pass initial sample QC thresholds
+
+Sample QC was evaluated using two criteria - passing samples had to have:
+
+1) At least 65% of probes for a sample had a POOBAH of < 0.05
+2) A total intensity of > 200 million. The latter criterion tends to be more stringent (i.e., more likely to fail a sample) and is passed on work Embark did looking at the behavior of samples based on their total intensity. Samples below a total intensity of 2 million were almost always outliers when evaluating them in PCA space. Two figures from that work can be found here: `img/001_PCA_WithLowIntensity.png` and `001_totalIntensityHistogramFinal_V2.png`.
+
+```{r eval=F}
+# List of samples that pass both POOBAH and total intensity thresholds
+sample_QC_pass <- m_df$sample_id[m_df$intensity_pass & m_df$poobah_pass]
+
+# Subset beta and poobah matrices
+beta <- beta[beta$sample_ID %in% sample_QC_pass,]
+beta_noLabel <- dplyr::select(beta,-sample_ID)
+poobah <- poobah[poobah$sample_ID %in% sample_QC_pass,]
+poobah_noLabel <- dplyr::select(poobah,-sample_ID)
+m_df <- m_df[m_df$sample_id %in% sample_QC_pass,]
+```
+
+```{r eval=F}
+m_df %>%
+  group_by(Experiment_id) %>%
+  summarize(Num_Dogs = length(unique(dog))) %>%
+  kable() %>%
+  kableExtra::kable_styling()
+
+m_df %>% 
+  group_by(Experiment_id,run) %>%
+  summarize(Num_Replicates = n()) %>%
+  kable() %>%
+  kableExtra::kable_styling()
+```
+
+**Table 1** Number of unique dogs by experiment
+
+![](../img/summaryTable1.png)
+
+**Table 2** Number of replicates by experiment
+
+![](../img/summaryTable2.png)
+
+## Calculate the pairwise pearson correlation between each dog/replicate
+
+#### Summarize POOBAH scores
+
+Here I summarize the number of probes with poobah pvalues < 0.05 for each replicate. Replicates had a 'passing' pOOBAH score if at least 65% of all probes had a p-value < 0.05. From the table below you can see the minimum pOOBAH score was 0.82 (82%), indicating that all replicate samples had passing pOOBAH scores.
+
+```{r eval=F}
+# Summarize the poobah metrics
+sumPassingPoobah <- function(x,thres=0.05){sum(x<thres)}
+hist(as.numeric(poobah[1,]))
+as.numeric(poobah[1,]) < 0
+poobah_summary <- data.frame(sample_ID = poobah$sample_ID, # Sample ID
+                             # Calculate number of probes that have poobah < 0.05
+                             p_passing = apply(poobah_noLabel,1,sumPassingPoobah)) %>% 
+  # Calculate probe of passing probes per sample
+  dplyr::mutate(p_passing_prop = p_passing/ncol(poobah_noLabel))  %>%
+  summarize(Passing_Probes_Avg = mean(p_passing),Passing_Probes_Min = min(p_passing),Passing_Probes_Max = max(p_passing),
+            Passing_Probes_Proportion_Avg = mean(p_passing_prop),
+            Passing_Probes_Proportion_Min = min(p_passing_prop),
+            Passing_Probes_Proportion_Max = max(p_passing_prop))
+
+kable(t(poobah_summary),digits=2) %>%
+  kableExtra::kable_styling()
+```
+
+**Table 3** Summary of average passing probes (pOOBAH < 0.05) across ALL replicates
+
+![](../img/summaryTable3.png)
+
+#### Pairwise pearson correlation using ALL unmasked probes.
+
+Summarize the pairwise pearson correlation between each replicate. To do this I use the `cor` function to calculate a pairwise correlation matrix (replicate x replicate), then identify pairs of replicates within the same dog vs. those between dogs. Next I calculate summary statistics (mean and sd) for pairwise correlations between replicates within the same dog vs. between dogs.
+
+```{r eval=F}
+# Pairwise pearson correlation matrix for each individual
+# NOTE: I use ALL probes for each sample to calculate the pearson correlation. This could include probes that do not have a passing POOBAH score. 
+df_corr <- data.frame(cor(t(beta_noLabel)))
+colnames(df_corr) <- m_df$dog
+df_corr$sample <- m_df$dog
+
+# Convert data to long format
+df_corr_melt <- data.frame(cor(t(beta_noLabel))) %>%
+  `colnames<-`(m_df$dog) %>%
+  data.frame(.) %>% # Not sure why this need to be transformed into a data.frame here, but this pipe will produce an error if this step is removed.
+  mutate(sample = m_df$dog) %>%
+  reshape2::melt(id.vars='sample',value.name='R2') %>%
+  filter(R2 != 1) %>%
+  mutate(withinGroup = ifelse(sample == variable,T,F)) %>%
+  group_by(withinGroup) %>%
+  dplyr::summarise(mean_r2 = mean(R2),
+                   sd_r2 = sd(R2))
+# Creates summary table of pairwise pearson correlation for replicates within and between dogs.
+```
+
+Here I calculate the median DNA methylation for EACH probe for EACH dog, then calculat the median absolute deviation (MAD) for those median values between dogs. This represents a measure of probe variation between dogs in our technical replicate data (i.e., the larger the MAD the more a probes methylation varies between dogs).
+
+Note on using MAD: I used MAD vs. variance since it is a robust metric and less influence by potential outliers in our relatively small dataset. When comparing the two metrics the results are very similar.
+
+```{r message=F,comment=F,eval=F}
+# Summarize the median and median absolute deviaiton (mad) of the median probe methylation among dogs 
+b_melt <- beta %>%
+  reshape2::melt() %>%
+  left_join(meta,by=c('sample_ID'='sample_id')) %>%
+  group_by(variable,dog) %>%
+  summarize(median_beta = median(value)) %>%
+  group_by(variable) %>%
+  summarise(b_median=median(median_beta),
+            b_mad=mad(median_beta))
+```
+
+#### Pairwise pearson correlation using different probe subsets
+
+Here I calculate the pearson correlation among replicates (within and among dogs) using various subsets of probes. Probe subsets are decided based on their MAD between dogs (i.e., how variable probe DNA methylation is between dogs). I explore a range of probe sets from unfiltered (i.e., all unmasked probes) to only probes with a MAD of 0.4 (see the third panel in Fig. 1 below). The expectation is that probes that show larger variation among dogs will be more likely to feature in the age model, so it is valuable to understand how or if pairwise correlations among replicates changes when considering only probes that show strong variation. 
+
+```{r eval=F}
+seq_cor <- seq(0,0.4,by=0.005)
+for(j in 1:length(seq_cor)){
+  # Pairwise pearson correlation matrix for each individual
+  target_probes <- b_melt$variable[b_melt$b_mad > seq_cor[j]]
+  df_corr <- data.frame(cor(t(beta_noLabel[,colnames(beta_noLabel) %in% target_probes])))
+  colnames(df_corr) <- m_df$dog
+  df_corr$sample <- m_df$dog
+  df_corr_melt <- df_corr %>%
+    reshape2::melt(id.vars='sample',value.name='R2') %>%
+    filter(R2 != 1) %>%
+    mutate(withinGroup = ifelse(sample == variable,T,F)) %>%
+    group_by(withinGroup) %>%
+    dplyr::summarise(mean_r2 = mean(R2),
+                     sd_r2 = sd(R2))
+  df_corr_melt$seq <- seq_cor[j]
+  df_corr_melt$cdf <- nrow(b_melt) - length(target_probes)
+  if(j == 1){
+    corr_df <- df_corr_melt
+  }else{
+    corr_df <- rbind(corr_df,df_corr_melt)
+  }
+}
+```
+
+```{r echo=F,eval=F}
+p1 <- ggplot(b_melt,aes(b_mad)) +
+  geom_histogram(bins=200) +
+  xlim(0,0.4) +
+  labs(x='Median absolute deviation (MAD) among ALL replicates',
+       y='Count',
+       title='Probe variation among replicates') +
+  theme_bw()
+
+p2 <- ggplot(corr_df,aes(x=seq,y=cdf)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  labs(y='Cumulative distribution of probes\n(CDF)',
+       x='Median absolute deviation (MAD) among ALL replicates')
+
+p3 <-ggplot(corr_df,aes(x=seq,y=mean_r2,colour=withinGroup)) +
+  geom_point() +
+  geom_errorbar(aes(x=seq,ymin=mean_r2 - sd_r2,ymax=mean_r2 + sd_r2)) +
+  geom_line() +
+  theme_bw() +
+  scale_color_discrete(labels=c('Between\nIndividuals','Within\nIndividuals')) +
+  labs(x='Minimum MAD Threshold',
+       y='pairwise R2\n(MEAN +/- SD)',
+       colour='Comparison') +
+  theme(legend.position = 'bottom')
+
+r2_figs <- plot_grid(p1,p2,p3,ncol=1,align = 'v')
+# The plotting warnings here are produced because I am forcing the axes. This results a very small number of probes to be
+# effectively dropped from the visualization. I don't think this is a problem.
+
+#ggsave(plot = r2_figs,filename = 'img/hist_probeVariationAmongReplicates.png',width = 8,height = 7,dpi = 600)
+```
+
+#### Fig 1 - Summarizing probes by median absolute deviation
+
+1) Panel A - Histogram of probes by median absolute deviation
+2) Panel B - Probe CDF by median absolute deviation
+3) Panel C - Pairwise R2 (mean +/- SD) using probes with a minimum MAD. For example,
+ average R2 values for for a minimum MAD threshold of 0.1 only include probes whose MAD was 0.1 or HIGHER. 
+
+![](../img/hist_probeVariationAmongReplicates.png)
+
+```{r eval=F,echo=F}
+TR_summary <- data.frame(numberUnmaskedProbes = ncol(beta),
+                         percentProbesPassingPoohbah_mean = mean(poobah_summary$p_passing_prop),
+                         percentProbesPassingPoohbah_sd = sd(poobah_summary$p_passing_prop),
+                         percentSamplePassing_65percentThreshold = sum(poobah_summary$p_passing_prop_thres/nrow(poobah)),
+                         R2_withinDog_mean = as.numeric(corr_df[corr_df$withinGroup == T & corr_df$seq == 0,'mean_r2']),
+                         R2_withinDog_sd = as.numeric(corr_df[corr_df$withinGroup == T & corr_df$seq == 0,'sd_r2']),
+                         R2_betweenDog_mean = as.numeric(corr_df[corr_df$withinGroup == F & corr_df$seq == 0,'mean_r2']),
+                         R2_betweenDog_sd = as.numeric(corr_df[corr_df$withinGroup == F & corr_df$seq == 0,'sd_r2']))
+
+## Optional Table
+kable(TR_summary) %>%
+  kableExtra::kable_styling()
+```
+
+## PCA of Technical Replicates
+
+```{r eval=F}
+pca<-prcomp(beta_noLabel)
+eigs <- pca$sdev^2
+
+fig_df <- data.frame(PC1 = pca$x[,'PC1'],PC2 = pca$x[,'PC2'],
+                     Exp_ID = m_df$Experiment_id,
+                     dog=m_df$dog,run=m_df$run,
+                     total_intensity = m_df$total_intensity,
+                     prop_poobah = m_df$poobah_prop,
+                     chip_row=as.character(m_df$chip_row),
+                     chip_col=as.character(m_df$chip_col),
+                     chip=as.character(m_df$chip))
+```
+
+### Diagnostic Plots
+
+```{r echo=F,eval=F}
+pal <- wes_palette("Zissou1",length(unique(m_df$dog)), type = "continuous")
+p1 <- ggplot(fig_df,aes(x=PC1,y=PC2,color=dog)) +
+  geom_point(aes(shape=run),size=2) +
+  scale_color_manual(values = pal) +
+  scale_shape_manual(values=c(1,16)) + 
+  geom_smooth(method = 'lm',se = F,linewidth=0.5) +
+  theme_bw() +
+  labs(shape='',colour='',
+       title=paste0('ILMN V3 Manifest - All unmasked probes (',ncol(beta_noLabel),' probes)'),
+       x=paste0('PC1 (',round((eigs[1]/sum(eigs))*100,2),' %)'),
+       y=paste0('PC2 (',round((eigs[2]/sum(eigs))*100,2),' %)')) +
+  theme(plot.title=element_text(hjust = 0.5),
+        legend.position = 'bottom')
+ggsave(plot = p1,filename = 'img/scatter_samplesInFirst2PCs_AllUnmaskedProbes.png',width = 8,height = 8,dpi = 600)
+```
+
+#### Figure 2 - Scatter plot with first two PCs from PCA using technical replicate samples
+
+A standard PCA was performed using all technical replicates (across both experiments) and all probes that were unmasked in the ILMN V3 masked manifest. I colored the samples by dog and used opened and closed circles to represent the two runs (this only applied to the `Analytical Validation` experiment). I also added a linear trendline to capture the variation within the first two PCs within a dog.
+
+![](../img/scatter_samplesInFirst2PCs_AllUnmaskedProbes.png)
+
+```{r echo=F,eval=F}
+p1 <- ggplot(fig_df,aes(x=PC1,y=PC2)) +
+  geom_point(aes(color=run,shape=chip_row),size=2) +
+  #scale_color_manual(values=pal) +
+  #scale_shape_manual(values=c(1,16)) + 
+  geom_smooth(aes(group=dog),method = 'lm',se = F,linewidth=0.5) +
+  theme_bw() +
+  labs(shape='Chip Row',colour='',
+       title=paste0('By chip row'),
+       x=paste0('PC1 (',round((eigs[1]/sum(eigs))*100,2),' %)'),
+       y=paste0('PC2 (',round((eigs[2]/sum(eigs))*100,2),' %)')) +
+  theme(plot.title=element_text(hjust = 0.5),
+        legend.position = 'bottom')
+
+p2 <- ggplot(fig_df,aes(x=PC1,y=PC2)) +
+  geom_point(aes(color=run,shape=chip_col),size=2) +
+  #scale_color_manual(values=pal) +
+  #scale_shape_manual(values=c(1,16)) + 
+  geom_smooth(aes(group=dog),method = 'lm',se = F,linewidth=0.5) +
+  theme_bw() +
+  labs(shape='Chip Column',colour='',
+       title=paste0('By chip column'),
+       x=paste0('PC1 (',round((eigs[1]/sum(eigs))*100,2),' %)'),
+       y=paste0('PC2 (',round((eigs[2]/sum(eigs))*100,2),' %)')) +
+  theme(plot.title=element_text(hjust = 0.5),
+        legend.position = 'bottom')
+
+p3 <- plot_grid(p1,p2,ncol=2,align = 'h')
+ggsave(plot = p3,filename = 'img/scatter_samplesInFirstTwoPCs_shapesByChipPosition_unmaskedProbes.png',width = 8,height = 6,dpi = 600)
+```
+
+#### Figure 3 - Scatter plot of first two PCs labelled by chip position
+
+This is the same scatter plot as Fig. 2, but I used different shapes to represent the placement of each sample on the chip (panel 1 by row and panel 2 by column). In this figure, color is used to represent the run number, while the linear trend line continues to capture the variation present within each dog.
+
+![](../img/scatter_samplesInFirstTwoPCs_shapesByChipPosition_unmaskedProbes.png)
+
+## Sample QC metrics summarized by chip and chip position
+
+#### Figure 4 - Dog replicates by chip position
+
+Bar plots showing the number of replicates present for each row and columns by dog. The number in parentheses represents the number of replicates for each dog. 
+
+```{r echo=F,eval=F}
+samples <- data.frame((table(fig_df$dog)))
+p1 <- ggplot(fig_df,aes(x=dog,fill=chip_row)) +
+  geom_bar(position='fill') +
+  coord_flip() +
+  scale_x_discrete(labels=paste0(samples$Var1,' (',samples$Freq,')')) +
+  scale_fill_manual(values=wes_palette(n=6, name="IsleofDogs1")) +
+  theme_bw() +
+  labs(title='Replicates by chip row')
+p2 <- ggplot(fig_df,aes(x=dog,fill=chip_col)) +
+  geom_bar(position='fill') +
+  coord_flip() +
+  scale_fill_manual(values=wes_palette(n=2, name="IsleofDogs1")) +
+  theme_bw() +
+  labs(title='Replicates by chip column') +
+  theme(axis.text.y = element_blank(),axis.title.y = element_blank())
+
+p3 <- plot_grid(p1,p2,ncol=2,align='h')
+ggsave(plot = p3,filename = 'img/barPlot_sampleQCmetricByChipPosition.png',width = 8,height = 5,dpi = 600)
+```
+
+![](../img/barPlot_sampleQCmetricByChipPosition.png)
+
+#### Figure 5 - Sample QC by run
+
+Density plots showing the distribution of sample total intensity (panel A) and proportion of probes with passing POOBAH scores (panel B) for the two different runs and experiments.
+
+```{r echo=F,eval=F}
+p1 <- ggplot(fig_df,aes(x=total_intensity,y=run,color=Exp_ID,fill=Exp_ID)) +
+  geom_density_ridges(alpha=0.25) +
+  theme_bw() +
+  scale_color_manual(values = wes_palette("Darjeeling1")) +
+  scale_fill_manual(values = wes_palette("Darjeeling1")) +
+  labs(y='Run',
+       x= 'Total Intensity') +
+  theme(legend.position = 'none')
+p2 <- ggplot(fig_df,aes(x=prop_poobah,y=run,color=Exp_ID,fill=Exp_ID)) +
+  geom_density_ridges(alpha=0.25) +
+  scale_color_manual(values = wes_palette("Darjeeling1")) +
+  scale_fill_manual(values = wes_palette("Darjeeling1")) +
+  theme_bw() +
+  labs(y='Run',
+       x= 'Proportion passing POOBAH (pval < 0.05)') +
+  theme(legend.position = 'bottom',
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())
+leg <- get_legend(p2)
+p2 <- p2 + theme(legend.position = 'none')
+
+p3 <- plot_grid(p1,p2,ncol=2,align='h',axis = 'b')
+p4 <- plot_grid(p3,leg,nrow=2,rel_heights = c(0.8,0.2))
+
+ggsave(plot = p4,filename = 'img/densityPlot_sampleQCmetricsByRun.png',width = 6,height = 4,dpi = 600)
+```
+
+![](../img/densityPlot_sampleQCmetricsByRun.png){width=80%}
+
+#### Figure 6 - Sample QC by chip
+
+Similar density plot, but with samples separated by chip.
+
+```{r echo=F,eval=F}
+p1 <- ggplot(fig_df,aes(x=total_intensity,y=chip,color=chip,fill=chip)) +
+  geom_density_ridges() +
+  theme_bw() +
+  labs(y='Chip ID',
+       x= 'Total Intensity') +
+  theme(legend.position = 'none')
+
+p2 <- ggplot(fig_df,aes(x=prop_poobah,y=chip,color=chip,fill=chip)) +
+  geom_density_ridges() +
+  theme_bw() +
+  labs(y='Chip ID',
+       x= 'Proportion passing POOBAH (pval < 0.05)') +
+  theme(legend.position = 'none',
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())
+
+p3 <- plot_grid(p1,p2,ncol=2,align='h')
+ggsave(plot = p3,filename = 'img/densityPlot_sampleQCmetricsByChip.png',width = 8,height = 8,dpi = 600)
+```
+
+![](../img/densityPlot_sampleQCmetricsByChip.png){width=80%}
+
+#### Figure 7 - Sample QC by chip position
+
+Sample density plot by chip position.
+
+```{r eval=F,echo=F}
+p1 <- ggplot(fig_df,aes(x=total_intensity,
+                  y=paste0('Row_',chip_row,'_Col_',chip_col),
+                  colour=interaction(chip_row,chip_col),
+                  fill=interaction(chip_row,chip_col))) +
+  geom_density_ridges() +
+  scale_color_manual(values = wes_palette("FantasticFox1",12, type = "continuous")) +
+  scale_fill_manual(values = wes_palette("FantasticFox1",12, type = "continuous")) +
+  theme_bw() +
+  labs(y='Chip Position',
+       x= 'Total Intensity') +
+  theme(legend.position = 'none')
+
+p2 <- ggplot(fig_df,aes(x=prop_poobah,
+                  y=paste0('Row_',chip_row,'_Col_',chip_col),
+                  colour=interaction(chip_row,chip_col),
+                  fill=interaction(chip_row,chip_col))) +
+  geom_density_ridges() +
+  scale_color_manual(values = wes_palette("FantasticFox1",12, type = "continuous")) +
+  scale_fill_manual(values = wes_palette("FantasticFox1",12, type = "continuous")) +
+  theme_bw() +
+  labs(y='Chip Position',
+       x= 'Proportion passing POOBAH (pval < 0.05)') +
+  theme(legend.position = 'none',
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())
+
+p3 <- plot_grid(p1,p2,ncol=2,align='h')
+ggsave(plot = p3,filename = 'img/densityPlot_sampleQCmetricsByChipPosition.png',width = 8,height = 8,dpi = 600)
+```
+
+![](../img/densityPlot_sampleQCmetricsByChipPosition.png){width=80%}
+
+## Summary
+
+1) **Pairwise replicate correlation** - Using pairwise correlation values we see that within dog correlation is very high (Fig. 1), even in probes that exhibit lots of variation (i.e., with larger MAD). Interestingly, when using all or most of the probes we see similar correlation scores between replicates from different dogs (the left side of Fig. 1 panel C), suggesting that pearson correlation may not be the best metric for evaluating technical variation in the data.
+2) **PCA** - A standard PCA was performed to visualize patterns in the technical replicate data. I focused on the first two PCs that explained most of the variation in the data. Here we see that most of the difference is likely driven by dog (which is what we hope for), but we also see persistent variation among replicates within the same dog (i.e., within dog technical variation). Some of this variation seems to be due to difference between runs (the difference between open and closed circles in Fig. 2). Relabeling the points by their placement on the chip (Fig. 3), it doesn't appear that chip placement is responsible for the variation observed between replicates within a dog.
+3) **Sample QC metrics by chip** - I did not observe that position on the chip resulted in consistent bias within the sample QC metrics (e.g., proportion passing poobah was not consistently lower on one side of the chip vs. the other; Fig. 7). However, I did observe a fair amount of variation among chips, particularly in total sample intensity (Fig. 8).
+3) **Thoughts on removing probes** -  If we create a PCA using only probes with the largest weights within our age model (i.e., the probes that are the most important in the model; plots not shown, but were included in our presentation at the QBR), the variation among technical replicates within a dog seems to be reduced. This indicates that technical variation may not substantially impact the most important probes in our current model. However, it may still be negatively impacting the overall performance of the model by limiting the strength of the association between additional probes and age, due to the presence of technical variation.  
+
+## Follow-up questions / next steps
+
+1) Is this phenomenon present in other DNAm datasets?
+2) What strategies might we want to implement to account for or remove this variation?
+  A) Generate artificial variable that captures technical variation in the data? (example visualization of this below)
+  B) Use surrogate variable analysis (e.g., iSVA)
+  B) Use batch correction approaches (COMBAT)
+  
+  
+#### Figure 8 - Example of using linear regression to generate artifical variable to represent technical error in sample.
+
+Example of how we might generate a simple artificial variable that capture some of the technical error in the data (viz. based on one of the in-house masked manifests).
+
+![](../img/fig8_exampleOfArtificalVariable.png)
+
